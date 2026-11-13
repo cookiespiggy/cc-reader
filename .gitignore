@@ -1,0 +1,38 @@
+# ── 依赖 / 构建产物 ──────────────────────────────
+node_modules/
+dist/
+src-tauri/target/
+
+# Tauri CLI 自动生成的 schema (随 CLI 版本变)
+src-tauri/gen/schemas/
+
+# ── 图标：手写 SVG 才是源，raster 由 scripts/build-icons.sh 生成 ──
+# build-icons.sh: icon.svg -> rsvg-convert -> icon-1024.png -> bunx tauri icon
+#   -> icon*.png / icon.ico / icon.icns 以及 Windows Square*.png
+src-tauri/icons/*.png
+src-tauri/icons/*.ico
+src-tauri/icons/*.icns
+
+# ── 本地数据快照 / 导出（含你的会话内容，不进版本库）──
+web/public/sessions.json
+web/public/transcript.json
+web/public/agent.json
+web/public/agents.json
+web/public/hits.json
+
+# ── 内部规划 / 交接 / AI 指引文档（不进公开仓库）──
+DESIGN.md
+HANDOFF.md
+TASKS.md
+AGENTS.md
+
+# ── 编辑器 / OS 杂项 ─────────────────────────────
+.DS_Store
+._*
+Thumbs.db
+*.log
+*.swp
+.vscode/
+.idea/
+.env
+.env.*

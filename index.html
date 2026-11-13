@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>CC Reader</title>
+    <script>
+      // React 挂载前先应用主题, 避免刷新时闪一帧深色 (Tauri csp: null, 内联脚本可执行)
+      // 与 App.tsx 的 readTheme 保持一致: 深色不挂 data-theme, light/pixel 才挂
+      try {
+        var t = localStorage.getItem("cc-reader-theme");
+        if (t === "light" || t === "pixel") {
+          document.documentElement.dataset.theme = t;
+        }
+      } catch {
+        // 隐私模式下 localStorage 不可用时走默认深色
+      }
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

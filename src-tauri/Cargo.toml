@@ -1,0 +1,34 @@
+[package]
+name = "cc-reader"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77"
+default-run = "cc-reader"
+# 只编一个 binary: 打包出来的 .app 里不会混进一堆可执行文件。
+# 命令行功能走子命令 (cc-reader index / search / dump)
+autobins = false
+
+[lib]
+name = "cc_reader_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "cc-reader"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# bundled: 自带编译 SQLite, 不依赖系统版本 (系统 SQLite 可能不带 FTS5)
+rusqlite = { version = "0.40", features = ["bundled"] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true
