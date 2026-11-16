@@ -1,8 +1,16 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
-import MessageList, { type AgentMeta, type Transcript } from "./MessageList";
+import MessageList, {
+  type AgentMeta,
+  type Msg,
+  type Transcript,
+  inputSummary,
+} from "./MessageList";
 import PetMascot from "./PetMascot";
+import { previewJson } from "./preview";
+import { THEME_KEY, THEME_LABEL, THEME_ORDER, applyTheme, readTheme, type Theme } from "./theme";
+import { SETTINGS_KEY, applySettings, readSettings, type Settings } from "./settings";
 
 type Session = {
   sessionId: string;
@@ -63,11 +71,26 @@ function humanSize(bytes: number): string {
 
 function shortTime(iso: string): string {
   if (!iso) return "";
-  // 2026-11-13T08:05:39.236Z -> 11-13 16:05 (本地)
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return iso.slice(0, 16).replace("T", " ");
+  const now = new Date();
+  const diffMs = now.getTime() - d.getTime();
+  const diffMin = Math.floor(diffMs / 60_000);
   const p = (n: number) => String(n).padStart(2, "0");
-  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+  const hhmm = `${p(d.getHours())}:${p(d.getMinutes())}`;
+
+  if (diffMin < 1) return "刚刚";
+  if (diffMin < 60) return `${diffMin} 分钟前`;
+
+  const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const yesterdayStart = new Date(todayStart.getTime() - 86_400_000);
+
+  if (d >= todayStart) return `今天 ${hhmm}`;
+  if (d >= yesterdayStart) return `昨天 ${hhmm}`;
+
+  const sameYear = d.getFullYear() === now.getFullYear();
+  if (sameYear) return `${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+  return `${String(d.getFullYear()).slice(2)}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
 }
 
 /** 命中片段高亮。
@@ -89,36 +112,135 @@ function snippetHtml(s: string, q: string): string {
   return out;
 }
 
-type Theme = "dark" | "light" | "pixel";
-const THEME_KEY = "cc-reader-theme";
-const THEME_ORDER: Theme[] = ["dark", "light", "pixel"];
-const THEME_LABEL: Record<Theme, string> = { dark: "深色", light: "浅色", pixel: "像素" };
+/** 阅读状态: 上次打开的会话 + 每个会话的滚动位置。只写 localStorage, 不碰 ~/.claude */
+const LAST_SESSION_KEY = "cc-reader-last-session";
+const SCROLL_KEY = "cc-reader-scroll";
 
-function readTheme(): Theme {
+type FindMatch = { key: string; midx: number; openKeys: string[] };
+const FIND_LIMIT = 300;
+
+/** 搜索工具输入时避免把 Write 的超大 content 整个 stringify */
+function toolInputHaystack(input: unknown): string {
+  if (input == null) return "";
+  if (typeof input === "string") return input.length <= 20000 ? input : "";
   try {
-    const saved = localStorage.getItem(THEME_KEY);
-    return saved === "light" || saved === "pixel" ? saved : "dark";
+    const s = JSON.stringify(input);
+    return s && s.length <= 20000 ? s : "";
   } catch {
-    return "dark";
+    return "";
+  }
+}
+
+function haystack(text: string): string {
+  return text.length > 1_000_000 ? text.slice(0, 1_000_000) : text;
+}
+
+/** 会话内查找: 折叠内容也纳入; openKeys 记录跳转前需要展开的祖先/自身 */
+function collectFindMatches(messages: Msg[], query: string): FindMatch[] {
+  const q = query.toLowerCase();
+  const out: FindMatch[] = [];
+  const walk = (list: Msg[], inherited: string[]) => {
+    for (const m of list) {
+      if (out.length >= FIND_LIMIT) return;
+      if (m.kind === "thinking") {
+        if (haystack(m.text).toLowerCase().includes(q)) {
+          out.push({ key: m.key, midx: m.index, openKeys: [...inherited, m.key] });
+        }
+        // thinking 的 children 渲染在 details 外, 不继承展开
+        walk(m.children, inherited);
+        continue;
+      }
+      if (m.kind === "tool_use") {
+        const visible = `${m.toolName ?? ""} ${inputSummary(m.toolName, m.input)}`;
+        if (visible.toLowerCase().includes(q)) {
+          out.push({ key: m.key, midx: m.index, openKeys: inherited });
+        } else if (toolInputHaystack(m.input).toLowerCase().includes(q)) {
+          out.push({ key: m.key, midx: m.index, openKeys: [...inherited, m.key] });
+        }
+        for (const c of m.children) {
+          walk([c], c.kind === "tool_result" ? [...inherited, m.key] : inherited);
+        }
+        continue;
+      }
+      if (m.kind !== "image" && haystack(m.text).toLowerCase().includes(q)) {
+        out.push({ key: m.key, midx: m.index, openKeys: inherited });
+      }
+      walk(m.children, inherited);
+    }
+  };
+  walk(messages, []);
+  return out;
+}
+
+type ScrollState = { top: number; midx: number | null; off: number };
+
+function readScrollMap(): Record<string, ScrollState> {
+  try {
+    const raw = JSON.parse(localStorage.getItem(SCROLL_KEY) || "{}");
+    if (!raw || typeof raw !== "object") return {};
+    const out: Record<string, ScrollState> = {};
+    for (const [k, v] of Object.entries(raw)) {
+      if (typeof v === "number") {
+        out[k] = { top: v, midx: null, off: 0 };
+      } else if (v && typeof v === "object") {
+        const o = v as { top?: unknown; midx?: unknown; off?: unknown };
+        if (typeof o.top === "number") {
+          out[k] = {
+            top: o.top,
+            midx: typeof o.midx === "number" ? o.midx : null,
+            off: typeof o.off === "number" ? o.off : 0,
+          };
+        }
+      }
+    }
+    return out;
+  } catch {
+    return {};
   }
 }
 
 export default function App() {
   const [theme, setTheme] = useState<Theme>(readTheme);
+  const [settings, setSettings] = useState<Settings>(readSettings);
+  const settingsRef = useRef(settings);
 
   useEffect(() => {
-    const root = document.documentElement;
-    // 深色即默认值, 不挂 data-theme: 否则 :root 与 [data-theme] 两套变量同时命中
-    if (theme === "dark") delete root.dataset.theme;
-    else root.dataset.theme = theme;
-    try {
-      localStorage.setItem(THEME_KEY, theme);
-    } catch {
-      // 隐私模式下 localStorage 不可用, 用默认深色
-    }
+    applyTheme(theme);
   }, [theme]);
 
-  const nextTheme = THEME_ORDER[(THEME_ORDER.indexOf(theme) + 1) % THEME_ORDER.length];
+  useEffect(() => {
+    settingsRef.current = settings;
+    applySettings(settings);
+  }, [settings]);
+
+  // 设置窗口改主题/选项时, 通过 storage 事件同步回主窗口
+  useEffect(() => {
+    const onStorage = (e: StorageEvent) => {
+      if (e.key === THEME_KEY) setTheme(readTheme());
+      else if (e.key === SETTINGS_KEY) setSettings(readSettings());
+    };
+    window.addEventListener("storage", onStorage);
+    return () => window.removeEventListener("storage", onStorage);
+  }, []);
+
+  const [themeMenu, setThemeMenu] = useState(false);
+  const themeMenuRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!themeMenu) return;
+    const onDown = (e: PointerEvent) => {
+      if (!themeMenuRef.current?.contains(e.target as Node)) setThemeMenu(false);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setThemeMenu(false);
+    };
+    window.addEventListener("pointerdown", onDown);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("pointerdown", onDown);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [themeMenu]);
 
   // 三栏宽度: 拖动分隔手柄调整, 双击恢复默认, 记在 localStorage (不碰 ~/.claude)
   const COL_DEFAULT = { projects: 216, sessions: 320 };
@@ -193,6 +315,15 @@ export default function App() {
   const [tLoading, setTLoading] = useState(false);
   const [tError, setTError] = useState<string | null>(null);
 
+  // 会话内查找
+  const [findOpen, setFindOpen] = useState(false);
+  const [findQ, setFindQ] = useState("");
+  const [findCursor, setFindCursor] = useState(0);
+  const [forceOpenKeys, setForceOpenKeys] = useState<Set<string>>(new Set());
+  const [findSeq, setFindSeq] = useState(0);
+  const findInputRef = useRef<HTMLInputElement>(null);
+  const findNavRef = useRef<{ key: string; openKeys: string[] } | null>(null);
+
   // 全文搜索
   const [hits, setHits] = useState<Hit[] | null>(null);
   const [searching, setSearching] = useState(false);
@@ -204,6 +335,18 @@ export default function App() {
   const listRef = useRef<VirtuosoHandle>(null);
   const sessionPaneRef = useRef<HTMLElement>(null);
   const detailRef = useRef<HTMLElement>(null);
+  const saveScrollTimer = useRef<number | null>(null);
+  const activeSessionIdRef = useRef<string | null>(null);
+  const restoreSuppressed = useRef(false);
+
+  useEffect(() => {
+    activeSessionIdRef.current = activeSession?.sessionId ?? null;
+  }, [activeSession]);
+
+  // 窗口标题 (macOS 隐藏标题栏后仍用于 Mission Control / 窗口菜单)
+  useEffect(() => {
+    document.title = activeSession ? `${activeSession.title} — CC Reader` : "CC Reader";
+  }, [activeSession]);
 
   const loadTranscript = useCallback((s: Session) => {
     setTLoading(true);
@@ -213,16 +356,17 @@ export default function App() {
     const inTauri = "__TAURI_INTERNALS__" in window;
     const req: Promise<Transcript> = inTauri
       ? invoke<Transcript>("read_transcript", { path: s.filePath })
-      : fetch("/transcript.json").then((r) => {
-          if (!r.ok) throw new Error(`transcript.json ${r.status}`);
-          return r.json();
-        });
+      : previewJson<Transcript>(
+          `/api/transcript?path=${encodeURIComponent(s.filePath)}`,
+          "/transcript.json",
+        );
     // subagent 元信息只读 meta.json, 很便宜, 并行拉
     const agentsReq: Promise<AgentMeta[]> = inTauri
       ? invoke<AgentMeta[]>("list_agents", { path: s.filePath })
-      : fetch("/agents.json")
-          .then((r) => (r.ok ? r.json() : []))
-          .catch(() => [] as AgentMeta[]);
+      : previewJson<AgentMeta[]>(
+          `/api/agents?path=${encodeURIComponent(s.filePath)}`,
+          "/agents.json",
+        ).catch(() => [] as AgentMeta[]);
 
     req
       .then(setTranscript)
@@ -236,6 +380,18 @@ export default function App() {
   // ---- 全文索引 ----
 
   const inTauri = "__TAURI_INTERNALS__" in window;
+
+  const openSettings = useCallback(async () => {
+    if (inTauri) {
+      try {
+        await invoke("open_settings");
+      } catch (e) {
+        setSearchErr(String(e));
+      }
+    } else {
+      window.open("/?settings=1", "cc-reader-settings", "width=560,height=720");
+    }
+  }, [inTauri]);
 
   // 索引概况 + 进度事件
   useEffect(() => {
@@ -254,7 +410,15 @@ export default function App() {
         un = f;
       })
       .catch(() => {});
-    return () => un?.();
+    // 在设置窗口重建索引后, 回到主窗口刷新一下统计
+    const onFocus = () => {
+      invoke<IndexStats>("index_stats").then(setIdxStats).catch(() => {});
+    };
+    window.addEventListener("focus", onFocus);
+    return () => {
+      un?.();
+      window.removeEventListener("focus", onFocus);
+    };
   }, [inTauri]);
 
   const buildIndex = useCallback(async (force: boolean) => {
@@ -302,6 +466,34 @@ export default function App() {
     [projects],
   );
 
+  // 重开 app: 回到上次阅读的会话 (设置里可关)
+  const restoredRef = useRef(false);
+  useEffect(() => {
+    if (restoredRef.current || allSessions.length === 0) return;
+    restoredRef.current = true;
+    if (!settingsRef.current.restoreLastSession) return;
+    let sid = "";
+    try {
+      sid = localStorage.getItem(LAST_SESSION_KEY) || "";
+    } catch {
+      // 隐私模式下 localStorage 不可用
+    }
+    const last = sid ? allSessions.find((s) => s.sessionId === sid) : undefined;
+    if (!last) return;
+    setActiveProject(last.projectDir);
+    setActiveSession(last);
+    loadTranscript(last);
+  }, [allSessions, loadTranscript]);
+
+  useEffect(() => {
+    if (!activeSession) return;
+    try {
+      localStorage.setItem(LAST_SESSION_KEY, activeSession.sessionId);
+    } catch {
+      // 忽略
+    }
+  }, [activeSession]);
+
   /** 跳到命中处。agent 的命中会回退到它所属的主会话 */
   const jumpToHit = useCallback(
     (hit: Hit) => {
@@ -324,6 +516,7 @@ export default function App() {
     if (!transcript || pendingScroll.current == null) return;
     const midx = pendingScroll.current;
     pendingScroll.current = null;
+    restoreSuppressed.current = true;
     requestAnimationFrame(() => {
       const el = document.getElementById(`m${midx}`);
       if (el) {
@@ -334,16 +527,173 @@ export default function App() {
     });
   }, [transcript]);
 
+  // 普通打开会话: 恢复上次滚动位置 (搜索跳转优先, 由上一个 effect 抑制)
+  // 用「顶部消息 + 偏移」做锚点, 折叠状态变化时仍能落到同一段内容
+  useEffect(() => {
+    if (!transcript) return;
+    if (restoreSuppressed.current) {
+      restoreSuppressed.current = false;
+      return;
+    }
+    const pane = detailRef.current;
+    const sid = activeSessionIdRef.current;
+    if (!pane || !sid) return;
+    const state = readScrollMap()[sid];
+    if (!state) return;
+    let timer = 0;
+    const apply = () => {
+      const el = state.midx != null ? document.getElementById(`m${state.midx}`) : null;
+      if (!el) {
+        pane.scrollTop = state.top;
+        return;
+      }
+      // 元素可能因折叠变矮: 最多恢复到「元素底部上方 24px」
+      const h = el.getBoundingClientRect().height;
+      const off = state.off < 0 ? Math.max(state.off, 24 - h) : state.off;
+      const delta = el.getBoundingClientRect().top - pane.getBoundingClientRect().top - off;
+      pane.scrollTop = Math.max(0, pane.scrollTop + delta);
+    };
+    requestAnimationFrame(() => {
+      apply();
+      // 高亮/图片等异步布局可能改变高度, 再兜一次
+      timer = window.setTimeout(apply, 120);
+    });
+    return () => window.clearTimeout(timer);
+  }, [transcript]);
+
+  const onDetailScroll = useCallback(() => {
+    const pane = detailRef.current;
+    const sid = activeSessionIdRef.current;
+    if (!pane || !sid || !transcript || tLoading) return;
+    if (saveScrollTimer.current != null) window.clearTimeout(saveScrollTimer.current);
+    saveScrollTimer.current = window.setTimeout(() => {
+      saveScrollTimer.current = null;
+      try {
+        const paneTop = pane.getBoundingClientRect().top;
+        let anchor: HTMLElement | null = null;
+        for (const el of pane.querySelectorAll<HTMLElement>(".msg[id]")) {
+          if (el.getBoundingClientRect().top <= paneTop + 12) anchor = el;
+          else break;
+        }
+        // 锚点若在展开的工具/思考内容里, 提升到最外层消息, 收起后仍可定位
+        while (anchor) {
+          const parent = anchor.parentElement?.closest<HTMLElement>(".msg");
+          if (!parent || !pane.contains(parent)) break;
+          anchor = parent;
+        }
+        const midx = anchor ? Number.parseInt(anchor.id.slice(1), 10) : NaN;
+        const map = readScrollMap();
+        map[sid] = {
+          top: pane.scrollTop,
+          midx: Number.isFinite(midx) ? midx : null,
+          off: anchor ? anchor.getBoundingClientRect().top - paneTop : 0,
+        };
+        localStorage.setItem(SCROLL_KEY, JSON.stringify(map));
+      } catch {
+        // 忽略
+      }
+    }, 180);
+  }, [transcript, tLoading]);
+
+  // ---- 会话内查找 ----
+
+  const findHits = useMemo(
+    () => (transcript && findQ.trim() ? collectFindMatches(transcript.messages, findQ.trim()) : []),
+    [transcript, findQ],
+  );
+
+  const navigateFind = useCallback(
+    (index: number) => {
+      if (findHits.length === 0) return;
+      const n = ((index % findHits.length) + findHits.length) % findHits.length;
+      setFindCursor(n);
+      const hit = findHits[n];
+      if (hit.openKeys.length) setForceOpenKeys(new Set(hit.openKeys));
+      findNavRef.current = { key: hit.key, openKeys: hit.openKeys };
+      setFindSeq((x) => x + 1);
+    },
+    [findHits],
+  );
+
+  // 输入变化 / 打开查找条: 自动跳到第一个命中
+  useEffect(() => {
+    if (!findOpen || !findQ.trim()) return;
+    if (findHits.length === 0) {
+      setFindCursor(0);
+      return;
+    }
+    navigateFind(0);
+  }, [findHits, findOpen, findQ, navigateFind]);
+
+  // 命中可能在折叠块里: 等展开挂载后滚动 + flash
+  useEffect(() => {
+    if (!findSeq) return;
+    const nav = findNavRef.current;
+    const pane = detailRef.current;
+    if (!nav || !pane) return;
+    let alive = true;
+    const tryScroll = () => {
+      if (!alive) return true;
+      const sel = (k: string) => `[data-key="${CSS.escape(k)}"]`;
+      const exact = pane.querySelector<HTMLElement>(sel(nav.key));
+      if (exact) {
+        pane.querySelectorAll<HTMLElement>(".find-current").forEach((n) => {
+          n.classList.remove("find-current");
+        });
+        exact.classList.add("find-current", "flash");
+        exact.scrollIntoView({ behavior: "smooth", block: "center" });
+        window.setTimeout(() => exact.classList.remove("flash"), 2200);
+        return true;
+      }
+      // 目标还没挂载: 先把祖先滚进视野, 继续等下一轮
+      if (nav.openKeys.length) {
+        pane
+          .querySelector<HTMLElement>(sel(nav.openKeys[0]))
+          ?.scrollIntoView({ behavior: "smooth", block: "center" });
+      }
+      return false;
+    };
+    const timers: number[] = [];
+    if (!tryScroll()) {
+      for (const ms of [60, 180, 400, 900]) timers.push(window.setTimeout(tryScroll, ms));
+    }
+    return () => {
+      alive = false;
+      timers.forEach((t) => window.clearTimeout(t));
+    };
+  }, [findSeq]);
+
+  // 已挂载的命中加淡标记, 当前命中加强调
+  useEffect(() => {
+    const pane = detailRef.current;
+    if (!pane) return;
+    pane.querySelectorAll<HTMLElement>(".find-hit, .find-current").forEach((el) => {
+      el.classList.remove("find-hit", "find-current");
+    });
+    if (!findOpen || !findQ.trim()) return;
+    findHits.forEach((h, i) => {
+      const el = pane.querySelector<HTMLElement>(`[data-key="${CSS.escape(h.key)}"]`);
+      if (!el) return;
+      el.classList.add(i === findCursor ? "find-current" : "find-hit");
+    });
+  }, [findHits, findCursor, findOpen, findQ]);
+
+  // 切换会话: 关闭查找并清空
+  useEffect(() => {
+    setFindOpen(false);
+    setFindQ("");
+    setFindCursor(0);
+    setForceOpenKeys(new Set());
+    findNavRef.current = null;
+  }, [activeSession?.sessionId]);
+
   useEffect(() => {
     let cancelled = false;
     // 桌面端走 Tauri IPC; 浏览器预览模式读静态 dump, 方便用 playwright 截图和快速迭代 UI
     const inTauri = "__TAURI_INTERNALS__" in window;
     const req: Promise<Project[]> = inTauri
       ? invoke<Project[]>("list_projects")
-      : fetch("/sessions.json").then((r) => {
-          if (!r.ok) throw new Error(`sessions.json ${r.status}`);
-          return r.json();
-        });
+      : previewJson<Project[]>("/api/sessions", "/sessions.json");
 
     req
       .then((groups) => {
@@ -362,14 +712,33 @@ export default function App() {
     };
   }, []);
 
-  // 全局快捷键: Cmd+F 聚焦搜索, Esc 清搜索并把焦点交回会话栏
+  // 全局快捷键: ⌘F 会话内查找 / ⇧⌘F 全局搜索 / ⌘G 下一个命中 / Esc 关闭
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key === "f") {
+      const mod = e.metaKey || e.ctrlKey;
+      if (mod && e.key.toLowerCase() === "f") {
         e.preventDefault();
-        searchRef.current?.focus();
-        searchRef.current?.select();
+        if (e.shiftKey || !transcript) {
+          searchRef.current?.focus();
+          searchRef.current?.select();
+        } else {
+          setFindOpen(true);
+          requestAnimationFrame(() => {
+            findInputRef.current?.focus();
+            findInputRef.current?.select();
+          });
+        }
+      } else if (mod && e.key.toLowerCase() === "g" && findOpen && findHits.length > 0) {
+        e.preventDefault();
+        navigateFind(findCursor + (e.shiftKey ? -1 : 1));
+      } else if (mod && e.key === ",") {
+        e.preventDefault();
+        void openSettings();
       } else if (e.key === "Escape") {
+        if (findOpen) {
+          setFindOpen(false);
+          return;
+        }
         if (document.activeElement === searchRef.current) {
           setQuery("");
           setHits(null);
@@ -380,7 +749,7 @@ export default function App() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, []);
+  }, [findOpen, findHits, findCursor, navigateFind, transcript, openSettings]);
 
   const q = query.trim().toLowerCase();
 
@@ -541,6 +910,10 @@ export default function App() {
 
   const onDetailKey = useCallback(
     (e: React.KeyboardEvent) => {
+      const target = e.target as HTMLElement;
+      if (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable) {
+        return;
+      }
       if (e.key === "n" || e.key === "j") {
         e.preventDefault();
         jumpMessage(1);
@@ -594,7 +967,7 @@ export default function App() {
       case "session":
         return (
           <div
-            className={`session${row.active ? " active" : ""}`}
+            className={`session${row.active ? " active" : ""}${row.session.isSidechain ? " sidechain" : ""}`}
             onClick={() => {
               setActiveSession(row.session);
               loadTranscript(row.session);
@@ -616,8 +989,29 @@ export default function App() {
   return (
     <div className="app">
       <header className="topbar" data-tauri-drag-region>
-        <div className="brand" data-tauri-drag-region>
-          CC Reader <span>claude code transcripts</span>
+        <div className="tb-title" data-tauri-drag-region>
+          {activeSession ? (
+            <>
+              <div className="tb-main" title={activeSession.title} data-tauri-drag-region>
+                {activeSession.title || "未命名会话"}
+              </div>
+              <div
+                className="tb-sub"
+                title={`${activeSession.projectPath} · ${activeSession.sessionId}`}
+                data-tauri-drag-region
+              >
+                {activeSession.projectPath.split("/").filter(Boolean).pop() ??
+                  activeSession.projectDir}
+                {" · "}
+                {activeSession.sessionId.slice(0, 8)}
+              </div>
+            </>
+          ) : (
+            <>
+              <div className="tb-main brand" data-tauri-drag-region>CC Reader</div>
+              <div className="tb-sub brand" data-tauri-drag-region>claude code transcripts</div>
+            </>
+          )}
         </div>
         <div className="search">
           <input
@@ -638,33 +1032,48 @@ export default function App() {
               }
             }}
           />
-          <kbd>⌘F</kbd>
+          {searching ? <span className="search-spinner" aria-label="搜索中" /> : <kbd>⇧⌘F</kbd>}
         </div>
         <div className="stats">
-          {idxStats && (
-            <span className="idx-badge" title="全文索引已收录的消息条数">
-              <b>{idxStats.messages.toLocaleString()}</b> 条
-            </span>
-          )}
           <button
+            type="button"
             className="btn"
-            onClick={() => buildIndex(false)}
-            disabled={indexing}
-            title="增量更新全文索引"
+            onClick={() => void openSettings()}
+            title="设置 (⌘,)"
           >
-            {indexing
-              ? idxProgress && idxProgress.total
-                ? `索引中 ${idxProgress.done}/${idxProgress.total}`
-                : "索引中…"
-              : "更新索引"}
+            设置
           </button>
-          <button
-            className="btn theme-toggle"
-            onClick={() => setTheme(nextTheme)}
-            title={`切换主题：深色 → 浅色 → 像素（当前${THEME_LABEL[theme]}）。记在 localStorage，不写 ~/.claude`}
-          >
-            {THEME_LABEL[nextTheme]}
-          </button>
+          <div className="theme-menu" ref={themeMenuRef}>
+            <button
+              className="btn theme-toggle"
+              aria-haspopup="menu"
+              aria-expanded={themeMenu}
+              title="切换主题"
+              onClick={() => setThemeMenu((v) => !v)}
+            >
+              {THEME_LABEL[theme]} ▾
+            </button>
+            {themeMenu && (
+              <div className="theme-pop" role="menu">
+                {THEME_ORDER.map((t) => (
+                  <button
+                    key={t}
+                    type="button"
+                    role="menuitemradio"
+                    aria-checked={t === theme}
+                    className={t === theme ? "on" : ""}
+                    onClick={() => {
+                      setTheme(t);
+                      setThemeMenu(false);
+                    }}
+                  >
+                    <span>{THEME_LABEL[t]}</span>
+                    {t === theme && <span className="tick">✓</span>}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
         </div>
       </header>
 
@@ -679,27 +1088,59 @@ export default function App() {
             <span>项目</span>
             <span>{projects.length}</span>
           </div>
-          {loading && <div className="loading">扫描 ~/.claude/projects …</div>}
-          {filtered.map((p) => (
-            <div
-              key={p.dir}
-              className={`project${current?.dir === p.dir ? " active" : ""}`}
-              onClick={() => {
-                setActiveProject(p.dir);
-                setActiveSession(null);
-              }}
-              title={p.path}
-            >
-              <div className="project-name">
-                <span>{p.path.split("/").filter(Boolean).pop() ?? p.dir}</span>
-                <span className="project-count">{p.sessions.length}</span>
+          <div className="projects-scroll">
+            {loading && <div className="loading">扫描 ~/.claude/projects …</div>}
+            {filtered.map((p) => (
+              <div
+                key={p.dir}
+                className={`project${current?.dir === p.dir ? " active" : ""}`}
+                onClick={() => {
+                  setActiveProject(p.dir);
+                  setActiveSession(null);
+                }}
+                title={p.path}
+              >
+                <div className="project-name">
+                  <span>{p.path.split("/").filter(Boolean).pop() ?? p.dir}</span>
+                  <span className="project-count">{p.sessions.length}</span>
+                </div>
+                <div className="project-path">{p.path}</div>
               </div>
-              <div className="project-path">{p.path}</div>
+            ))}
+            {!loading && filtered.length === 0 && (
+              <div className="empty-note">没有匹配的项目</div>
+            )}
+          </div>
+          <div className="pane-foot">
+            <div className="pane-foot-row">
+              <span title={inTauri ? "全文索引已收录的消息条数" : "浏览器预览不建索引"}>
+                {idxStats
+                  ? `${idxStats.messages.toLocaleString()} 条`
+                  : inTauri
+                    ? "索引未建立"
+                    : "浏览器预览"}
+              </span>
+              {inTauri && (
+                <button
+                  type="button"
+                  className="mini-btn"
+                  onClick={() => buildIndex(false)}
+                  disabled={indexing}
+                  title="增量更新全文索引"
+                >
+                  {indexing ? "索引中…" : "更新索引"}
+                </button>
+              )}
             </div>
-          ))}
-          {!loading && filtered.length === 0 && (
-            <div className="empty-note">没有匹配的项目</div>
-          )}
+            {indexing && idxProgress && idxProgress.total > 0 && (
+              <div className="idx-progress-wrap">
+                <div
+                  className="idx-progress-bar"
+                  style={{ width: `${Math.round((idxProgress.done / idxProgress.total) * 100)}%` }}
+                />
+              </div>
+            )}
+          </div>
         </aside>
 
         <div
@@ -743,7 +1184,62 @@ export default function App() {
           ref={detailRef}
           tabIndex={0}
           onKeyDown={onDetailKey}
+          onScroll={onDetailScroll}
         >
+          {findOpen && activeSession && (
+            <div className="findbar">
+              <input
+                ref={findInputRef}
+                className={`find-input${findQ.trim() && findHits.length === 0 ? " empty" : ""}`}
+                value={findQ}
+                placeholder="在当前会话中查找"
+                onChange={(e) => setFindQ(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    navigateFind(findCursor + (e.shiftKey ? -1 : 1));
+                  } else if (e.key === "Escape") {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    setFindOpen(false);
+                  }
+                }}
+              />
+              <span className={`find-count${findQ.trim() && findHits.length === 0 ? " empty" : ""}`}>
+                {findQ.trim()
+                  ? findHits.length
+                    ? `${findCursor + 1}/${findHits.length}${findHits.length >= FIND_LIMIT ? "+" : ""}`
+                    : "0/0"
+                  : ""}
+              </span>
+              <button
+                type="button"
+                className="mini-btn"
+                onClick={() => navigateFind(findCursor - 1)}
+                disabled={findHits.length === 0}
+                title="上一个 (⇧Enter)"
+              >
+                ↑
+              </button>
+              <button
+                type="button"
+                className="mini-btn"
+                onClick={() => navigateFind(findCursor + 1)}
+                disabled={findHits.length === 0}
+                title="下一个 (Enter / ⌘G)"
+              >
+                ↓
+              </button>
+              <button
+                type="button"
+                className="mini-btn"
+                onClick={() => setFindOpen(false)}
+                title="关闭 (Esc)"
+              >
+                ✕
+              </button>
+            </div>
+          )}
           {error ? (
             <div className="error">{error}</div>
           ) : activeSession ? (
@@ -768,12 +1264,28 @@ export default function App() {
                       消息 <b>{transcript.messageCount}</b>
                     </span>
                   )}
+                  {activeSession.isSidechain && (
+                    <span className="detail-sidechain">⇥ 续话分支</span>
+                  )}
                 </div>
               </div>
-              {tLoading && <div className="loading">解析 transcript …</div>}
+              {tLoading && (
+                <div className="transcript-skeleton" aria-label="加载中">
+                  {[1, 2, 3, 4, 5].map((i) => (
+                    <div key={i} className="sk-msg">
+                      <div className="sk-who" />
+                      <div className="sk-bubble" />
+                    </div>
+                  ))}
+                </div>
+              )}
               {tError && <div className="error">{tError}</div>}
               {transcript && (
-                <MessageList messages={transcript.messages} agents={agents} />
+                <MessageList
+                  messages={transcript.messages}
+                  agents={agents}
+                  forceOpen={forceOpenKeys}
+                />
               )}
             </>
           ) : (
@@ -786,7 +1298,9 @@ export default function App() {
                 <span><kbd>PgUp</kbd><kbd>PgDn</kbd> 翻页</span>
                 <span><kbd>Enter</kbd> 开始阅读</span>
                 <span><kbd>n</kbd><kbd>p</kbd> 跳消息</span>
-                <span><kbd>⌘F</kbd> 搜索</span>
+                <span><kbd>⌘F</kbd> 会话内查找</span>
+                <span><kbd>⇧⌘F</kbd> 全局搜索</span>
+                <span><kbd>⌘,</kbd> 设置</span>
               </div>
             </div>
           )}

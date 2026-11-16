@@ -1,10 +1,21 @@
-import { useMemo, useState } from "react";
+import { memo, useEffect, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import remarkCjkFriendly from "remark-cjk-friendly/parseOnly";
 import { invoke } from "@tauri-apps/api/core";
+import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
+import { CodeBlock } from "./CodeBlock";
+import { copyText } from "./clipboard";
+import { formatJsonText } from "./jsonFormat";
+import { previewJson } from "./preview";
+import { codeBlockFromChildren } from "./codeFence";
+import { TableBlock, Td, Th } from "./TableBlock";
+import { DiffBlock } from "./DiffBlock";
 
 export type Msg = {
   index: number;
+  /** Rust 侧唯一键(uuid#block), 查找/跳转用; index 是行号, 同一行多个 block 会重复 */
+  key: string;
   kind:
     | "user"
     | "assistant"
@@ -58,7 +69,7 @@ function humanSize(bytes: number): string {
 }
 
 /** 工具调用的输入摘要: 取最有辨识度的那个字段 */
-function inputSummary(name: string | undefined, input: unknown): string {
+export function inputSummary(name: string | undefined, input: unknown): string {
   if (!input || typeof input !== "object") return "";
   const o = input as Record<string, unknown>;
   const prefer: Record<string, string[]> = {
@@ -86,60 +97,6 @@ function inputSummary(name: string | undefined, input: unknown): string {
   return "";
 }
 
-/** 超长输出: 先给前 1200 行 / 100KB, 点「显示全部」再铺开。
- *  折叠块本身已按需挂载, 这里守的是「展开后仍可能几百 KB」的第二道门。 */
-const PREVIEW_LINES = 1200;
-const PREVIEW_CHARS = 100 * 1024;
-
-/** diff 文本 -> 带 +/- 着色的行 */
-function DiffBlock({ text }: { text: string }) {
-  const [expanded, setExpanded] = useState(false);
-  const lines = useMemo(() => text.split("\n"), [text]);
-  const isDiff = useMemo(() => lines.some((l) => l.startsWith("@@")), [lines]);
-  const needsPreview = text.length > PREVIEW_CHARS || lines.length > PREVIEW_LINES;
-  const truncated = needsPreview && !expanded;
-  const shownLines = truncated ? lines.slice(0, PREVIEW_LINES) : lines;
-  const plain = truncated
-    ? shownLines.join("\n").slice(0, PREVIEW_CHARS)
-    : text;
-
-  return (
-    <>
-      {isDiff ? (
-        <pre className="out diff">
-          {shownLines.map((l, i) => {
-            const cls = l.startsWith("+")
-              ? "dl-add"
-              : l.startsWith("-")
-                ? "dl-del"
-                : l.startsWith("@@")
-                  ? "dl-hunk"
-                  : "";
-            return (
-              <div key={i} className={cls}>
-                {l || " "}
-              </div>
-            );
-          })}
-        </pre>
-      ) : (
-        <pre className="out">{plain}</pre>
-      )}
-      {truncated && (
-        <div className="out-trunc-note">
-          <span>
-            仅显示前 {Math.min(PREVIEW_LINES, lines.length)} 行 · 共{" "}
-            {lines.length.toLocaleString()} 行 / {text.length.toLocaleString()} 字符
-          </span>
-          <button className="btn out-more" onClick={() => setExpanded(true)}>
-            显示全部
-          </button>
-        </div>
-      )}
-    </>
-  );
-}
-
 /** subagent 对话: 按需加载, 409M 的 agent transcript 不能一次全读 */
 function AgentBlock({ agent }: { agent: AgentMeta }) {
   const [state, setState] = useState<"idle" | "loading" | "loaded" | "error">("idle");
@@ -154,10 +111,10 @@ function AgentBlock({ agent }: { agent: AgentMeta }) {
       const inTauri = "__TAURI_INTERNALS__" in window;
       const t = inTauri
         ? await invoke<Transcript>("read_agent", { path: agent.jsonlPath })
-        : await fetch("/agent.json").then((r) => {
-            if (!r.ok) throw new Error(`agent.json ${r.status}`);
-            return r.json();
-          });
+        : await previewJson<Transcript>(
+            `/api/transcript?path=${encodeURIComponent(agent.jsonlPath)}`,
+            "/agent.json",
+          );
       setData(t);
       setState("loaded");
     } catch (e) {
@@ -205,64 +162,158 @@ function AgentBlock({ agent }: { agent: AgentMeta }) {
   );
 }
 
-function ToolBlock({ m, agents }: { m: Msg; agents: Map<string, AgentMeta> }) {
+/** 工具输入/输出旁的轻量复制按钮 */
+function CopyBtn({ text }: { text: string }) {
+  const [copied, setCopied] = useState(false);
+  return (
+    <button
+      type="button"
+      className="mini-btn"
+      title="复制"
+      onClick={() => {
+        void copyText(text).then((ok) => {
+          if (!ok) return;
+          setCopied(true);
+          window.setTimeout(() => setCopied(false), 1200);
+        });
+      }}
+    >
+      {copied ? "✓ 已复制" : "复制"}
+    </button>
+  );
+}
+
+/** 工具输入: 对象直接缩进; 字符串若是 JSON 也格式化, 否则原样 */
+function ToolInput({ input }: { input: unknown }) {
+  const text = typeof input === "string" ? input : JSON.stringify(input, null, 2);
+  const formatted = typeof input === "string" ? formatJsonText(text) : text;
+  const raw =
+    input && typeof input === "object"
+      ? (input as Record<string, unknown>).file_path ?? (input as Record<string, unknown>).notebook_path
+      : undefined;
+  const revealPath =
+    typeof raw === "string" && raw.startsWith("/") && "__TAURI_INTERNALS__" in window ? raw : null;
+  return (
+    <>
+      <div className="lbl-row">
+        <div className="lbl">输入</div>
+        <div className="lbl-actions">
+          {revealPath && (
+            <button
+              type="button"
+              className="mini-btn"
+              title="在 Finder 中显示"
+              onClick={() => {
+                void revealItemInDir(revealPath).catch(() => {});
+              }}
+            >
+              在 Finder 显示
+            </button>
+          )}
+          <CopyBtn text={text} />
+        </div>
+      </div>
+      {formatted ? <CodeBlock code={formatted} lang="json" /> : <pre className="out">{text}</pre>}
+    </>
+  );
+}
+
+function ToolBlock({
+  m,
+  agents,
+  forceOpen,
+}: {
+  m: Msg;
+  agents: Map<string, AgentMeta>;
+  forceOpen?: Set<string>;
+}) {
   const summary = inputSummary(m.toolName, m.input);
   const results = m.children.filter((c) => c.kind === "tool_result");
+  const hasError = results.some((r) => r.isError);
   const [open, setOpen] = useState(false);
   const agent = m.agentId ? agents.get(m.agentId) : undefined;
 
+  useEffect(() => {
+    if (forceOpen?.has(m.key)) setOpen(true);
+  }, [forceOpen, m.key]);
+
   return (
-    <details
-      id={`m${m.index}`}
-      className="msg tool"
-      open={open}
-      onToggle={(e) => setOpen((e.target as HTMLDetailsElement).open)}
-    >
-      <summary>
-        <span className="caret">▸</span>
-        <span className="tool-name">{m.toolName ?? "tool"}</span>
-        {summary && <span className="tool-arg">{summary}</span>}
-        {agent && <span className="agent-badge">subagent</span>}
-        {results.length > 0 && (
-          <span className="tool-meta">
-            {results[0].isError ? "ERROR" : `${results[0].text.length} 字符`}
-          </span>
-        )}
-      </summary>
-      {open && (
-        <div className="tool-body">
-          {m.input !== undefined && m.input !== null && (
-            <>
-              <div className="lbl">输入</div>
-              <pre className="out">
-                {typeof m.input === "string" ? m.input : JSON.stringify(m.input, null, 2)}
-              </pre>
-            </>
+    <>
+      <details
+        id={`m${m.index}`}
+        data-key={m.key}
+        className={`msg tool${hasError ? " error" : ""}`}
+        open={open}
+        onToggle={(e) => setOpen((e.target as HTMLDetailsElement).open)}
+      >
+        <summary>
+          <span className="caret">▸</span>
+          <span className="tool-name">{m.toolName ?? "tool"}</span>
+          {summary && <span className="tool-arg">{summary}</span>}
+          {agent && <span className="agent-badge">subagent</span>}
+          {results.length > 0 && (
+            <span className="tool-meta">
+              {hasError ? "ERROR" : `${results[0].text.length} 字符`}
+            </span>
           )}
-          {results.map((r) => (
-            <div key={r.index}>
-              <div className="lbl">输出{r.isError ? " (错误)" : ""}</div>
-              <DiffBlock text={r.text} />
-            </div>
-          ))}
-          {agent && <AgentBlock agent={agent} />}
-        </div>
-      )}
-    </details>
+        </summary>
+        {open && (
+          <div className="tool-body">
+            {m.input !== undefined && m.input !== null && <ToolInput input={m.input} />}
+            {results.map((r) => (
+              <div
+                key={r.key}
+                data-key={r.key}
+                className={r.isError ? "tool-out error" : "tool-out"}
+              >
+                <div className="lbl-row">
+                  <div className={`lbl${r.isError ? " err" : ""}`}>
+                    输出{r.isError ? " (错误)" : ""}
+                  </div>
+                  <CopyBtn text={r.text} />
+                </div>
+                <DiffBlock text={r.text} />
+              </div>
+            ))}
+            {agent && <AgentBlock agent={agent} />}
+          </div>
+        )}
+      </details>
+      <LooseChildren m={m} agents={agents} forceOpen={forceOpen} />
+    </>
   );
 }
 
 function Markdown({ text }: { text: string }) {
   return (
     <ReactMarkdown
-      remarkPlugins={[remarkGfm]}
+      remarkPlugins={[remarkGfm, remarkCjkFriendly]}
       components={{
-        a: (p) => <a {...p} target="_blank" rel="noreferrer" />,
-        table: (p) => (
-          <div className="table-wrap">
-            <table {...p} />
-          </div>
-        ),
+        a: ({ href, children, ...rest }) => {
+          const external = !!href && /^https?:/i.test(href);
+          return (
+            <a
+              {...rest}
+              href={href}
+              target="_blank"
+              rel="noreferrer"
+              onClick={(e) => {
+                if (!external || !("__TAURI_INTERNALS__" in window)) return;
+                e.preventDefault();
+                void openUrl(href).catch(() => window.open(href, "_blank"));
+              }}
+            >
+              {children}
+            </a>
+          );
+        },
+        pre: ({ children }) => {
+          const block = codeBlockFromChildren(children);
+          return block ? <CodeBlock code={block.code} lang={block.lang} /> : <pre>{children}</pre>;
+        },
+        table: (p) => <TableBlock {...p} />,
+        td: (p) => <Td {...p} />,
+        th: (p) => <Th {...p} />,
       }}
     >
       {text}
@@ -271,51 +322,86 @@ function Markdown({ text }: { text: string }) {
 }
 
 /** thinking 折叠态不挂载 markdown: 210 份解析结果不必在收起时就存在 */
-function ThinkingBlock({ m, agents }: { m: Msg; agents?: Map<string, AgentMeta> }) {
+function ThinkingBlock({
+  m,
+  agents,
+  forceOpen,
+}: {
+  m: Msg;
+  agents?: Map<string, AgentMeta>;
+  forceOpen?: Set<string>;
+}) {
   const [open, setOpen] = useState(false);
+
+  useEffect(() => {
+    if (forceOpen?.has(m.key)) setOpen(true);
+  }, [forceOpen, m.key]);
+
   return (
-    <details
-      id={`m${m.index}`}
-      className="msg thinking"
-      open={open}
-      onToggle={(e) => setOpen((e.target as HTMLDetailsElement).open)}
-    >
-      <summary>
-        <span className="think-mark" aria-hidden="true">◇</span>
-        <span className="think-label">思考</span>
-        <span className="think-meta">{m.text.length} 字符</span>
-      </summary>
-      {open && (
-        <div className="bubble plain">
-          <Markdown text={m.text} />
-        </div>
-      )}
-      <LooseChildren m={m} agents={agents} />
-    </details>
+    <>
+      <details
+        id={`m${m.index}`}
+        data-key={m.key}
+        className="msg thinking"
+        open={open}
+        onToggle={(e) => setOpen((e.target as HTMLDetailsElement).open)}
+      >
+        <summary>
+          <span className="think-mark" aria-hidden="true">◇</span>
+          <span className="think-label">思考</span>
+          <span className="think-meta">{m.text.length} 字符</span>
+        </summary>
+        {open && (
+          <div className="bubble plain">
+            <Markdown text={m.text} />
+          </div>
+        )}
+      </details>
+      {/* loose children 必须渲染在 details 外: 收起时 details 会隐藏 summary
+          以外的全部内容, 挂在里面会导致链在思考下的正式回答 / tool_use 整段不可见;
+          展开时则会被包进思考卡片 */}
+      <LooseChildren m={m} agents={agents} forceOpen={forceOpen} />
+    </>
   );
 }
 
 /** 按 parentUuid 挂进 children 的非配对节点(轮次小结 / away 摘要等),
     各渲染分支原本只挑 tool_result, 会把它们静默丢掉 */
-function LooseChildren({ m, agents }: { m: Msg; agents?: Map<string, AgentMeta> }) {
+function LooseChildren({
+  m,
+  agents,
+  forceOpen,
+}: {
+  m: Msg;
+  agents?: Map<string, AgentMeta>;
+  forceOpen?: Set<string>;
+}) {
   const extras = m.children.filter((c) => c.kind !== "tool_result");
   if (extras.length === 0) return null;
   const amap = agents ?? new Map<string, AgentMeta>();
   return (
     <>
       {extras.map((c) => (
-        <Node key={c.index} m={c} agents={amap} />
+        <Node key={c.key} m={c} agents={amap} forceOpen={forceOpen} />
       ))}
     </>
   );
 }
 
-function Node({ m, agents }: { m: Msg; agents: Map<string, AgentMeta> }) {
+function Node({
+  m,
+  agents,
+  forceOpen,
+}: {
+  m: Msg;
+  agents: Map<string, AgentMeta>;
+  forceOpen?: Set<string>;
+}) {
   const t = clock(m.timestamp);
   switch (m.kind) {
     case "user":
       return (
-        <div id={`m${m.index}`} className="msg user">
+        <div id={`m${m.index}`} data-key={m.key} className="msg user">
           <div className="who">
             <span>你</span>
             <span className="ts">{t}</span>
@@ -323,11 +409,12 @@ function Node({ m, agents }: { m: Msg; agents: Map<string, AgentMeta> }) {
           <div className="bubble">
             <Markdown text={m.text} />
           </div>
+          <LooseChildren m={m} agents={agents} forceOpen={forceOpen} />
         </div>
       );
     case "assistant":
       return (
-        <div id={`m${m.index}`} className="msg assistant">
+        <div id={`m${m.index}`} data-key={m.key} className="msg assistant">
           <div className="who">
             <span>Claude</span>
             <span className="ts">{t}</span>
@@ -335,23 +422,33 @@ function Node({ m, agents }: { m: Msg; agents: Map<string, AgentMeta> }) {
           <div className="bubble">
             <Markdown text={m.text} />
           </div>
-          <LooseChildren m={m} agents={agents} />
+          <LooseChildren m={m} agents={agents} forceOpen={forceOpen} />
         </div>
       );
     case "thinking":
-      return <ThinkingBlock m={m} agents={agents} />;
+      return <ThinkingBlock m={m} agents={agents} forceOpen={forceOpen} />;
     case "tool_use":
-      return <ToolBlock m={m} agents={agents} />;
+      return <ToolBlock m={m} agents={agents} forceOpen={forceOpen} />;
     case "tool_result":
       return (
-        <div id={`m${m.index}`} className="msg tool-result">
-          <div className="lbl">结果</div>
+        <div
+          id={`m${m.index}`}
+          data-key={m.key}
+          className={`msg tool-result${m.isError ? " error" : ""}`}
+        >
+          <div className="lbl-row">
+            <div className={`lbl${m.isError ? " err" : ""}`}>
+              结果{m.isError ? " (错误)" : ""}
+            </div>
+            <CopyBtn text={m.text} />
+          </div>
           <DiffBlock text={m.text} />
+          <LooseChildren m={m} agents={agents} forceOpen={forceOpen} />
         </div>
       );
     case "image":
       return (
-        <div id={`m${m.index}`} className="msg image">
+        <div id={`m${m.index}`} data-key={m.key} className="msg image">
           <div className="who">
             <span>你</span>
             <span className="ts">{t}</span>
@@ -363,13 +460,13 @@ function Node({ m, agents }: { m: Msg; agents: Map<string, AgentMeta> }) {
       // Rust 侧已把无 content 的系统事件合成摘要; 仍为空的直接不渲染, 不留空白卡片
       if (!m.text.trim()) return null;
       return (
-        <div id={`m${m.index}`} className="msg system">
+        <div id={`m${m.index}`} data-key={m.key} className="msg system">
           <div className="who">
             <span>system</span>
             <span className="ts">{t}</span>
           </div>
           <div className="bubble plain">{m.text}</div>
-          <LooseChildren m={m} agents={agents} />
+          <LooseChildren m={m} agents={agents} forceOpen={forceOpen} />
         </div>
       );
     default:
@@ -377,14 +474,16 @@ function Node({ m, agents }: { m: Msg; agents: Map<string, AgentMeta> }) {
   }
 }
 
-export default function MessageList({
+function MessageList({
   messages,
   agents,
   nested,
+  forceOpen,
 }: {
   messages: Msg[];
   agents?: Map<string, AgentMeta>;
   nested?: boolean;
+  forceOpen?: Set<string>;
 }) {
   if (messages.length === 0) {
     return <div className="empty-note">这个会话没有可渲染的消息</div>;
@@ -393,8 +492,10 @@ export default function MessageList({
   return (
     <div className={nested ? "msglist nested" : "msglist"}>
       {messages.map((m) => (
-        <Node key={m.index} m={m} agents={amap} />
+        <Node key={m.key} m={m} agents={amap} forceOpen={forceOpen} />
       ))}
     </div>
   );
 }
+
+export default memo(MessageList);

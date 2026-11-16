@@ -1,6 +1,8 @@
 # CC Reader
 
-把 Claude Code 的本地会话日志，重渲染成高密度桌面阅读器。**只读、本地、可搜索。**
+**A native macOS reader for Claude Code conversation logs** — browse, search, and read all your Claude Code sessions in a high-density IDE-style interface. Local-only, offline, no telemetry.
+
+> 把 Claude Code 的本地会话日志，重渲染成高密度桌面阅读器。**只读、本地、可搜索。**
 
 ![platform](https://img.shields.io/badge/platform-macOS-000000?logo=apple&logoColor=white)
 ![Tauri](https://img.shields.io/badge/Tauri-2.x-24C8DB?logo=tauri&logoColor=white)
@@ -8,11 +10,19 @@
 ![React](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=06181F)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
-Claude Code 每次对话都完整落盘到 `~/.claude/projects/<工作目录编码>/<session-id>.jsonl`，
-但你只能对着终端往上滚。CC Reader 直接读这些 JSONL，解析成消息树，按 IDE 的密度重新排版：
-思考过程、工具调用、命令输出默认收成一行摘要，真正要读的那几句话留在屏幕上。
+Claude Code stores every conversation to `~/.claude/projects/<dir>/<session-id>.jsonl`, but reading them means scrolling through terminal output. CC Reader parses those JSONL files into a **message tree**, re-renders them at IDE density, and makes them searchable — all locally, without touching any Claude Code files.
 
-全程只读 `~/.claude`，不写任何文件、不改任何配置，也不联网。
+**Key features:**
+- 🗂 **Three-panel layout** — projects → sessions → messages, works instantly with 40+ projects and 300+ sessions
+- 🌳 **Message tree, not flat log** — `thinking`, `tool_use`, and `tool_result` are separate collapsible nodes; subagent conversations load on demand
+- 🔍 **Full-text search** — SQLite FTS5 with trigram tokenization; searches across all sessions in 3–13ms
+- 🎨 **Three themes** — dark / light / pixel (PICO-8 palette), switchable from the toolbar
+- ⌨️ **Full keyboard navigation** — `↑↓` for sessions, `n/p` for messages, `⌘F` for in-session find
+- 🔒 **Read-only** — only writes the search index to `~/Library/Application Support/cc-reader/`; never modifies `~/.claude`
+
+Built with [Tauri 2](https://tauri.app) · Rust · React 19 · SQLite FTS5
+
+---
 
 ## 特性
 
